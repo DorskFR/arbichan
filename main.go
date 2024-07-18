@@ -69,7 +69,7 @@ func main() {
 
 	// HTTP Client Configuration
 	httpClient := &http.Client{
-		Timeout: 2 * time.Second,
+		Timeout: interval,
 		Transport: &http.Transport{
 			MaxIdleConns:        100,
 			MaxIdleConnsPerHost: 100,
@@ -168,8 +168,8 @@ func processExchangePair(
 		validResults = append(validResults, result)
 	}
 
-	if len(validResults) >= len(exchangePairs)-1 {
-		pairwise(pair, validResults)
+	if len(validResults) >= 2 {
+		pairCombinations(pair, validResults)
 	} else {
 		log.Warn().
 			Str("pair", pair).
@@ -191,7 +191,7 @@ func CalculateProfit(buyPrice float64, sellPrice float64, volume float64) float6
 	return (buyPrice - sellPrice) * volume
 }
 
-func pairwise(pair string, results []api.ExchangeAskBid) {
+func pairCombinations(pair string, results []api.ExchangeAskBid) {
 	for i := 0; i < len(results)-1; i++ {
 		for j := i + 1; j < len(results); j++ {
 			PrintArbitrageOpportunity(pair, results[i], results[j])
@@ -231,5 +231,5 @@ func PrintArbitrageOpportunity(pair string, exchange1 api.ExchangeAskBid, exchan
 			return
 		}
 	}
-	log.Info().Msgf("[%s] No arbitrage opportunity", pair)
+	// log.Info().Msgf("[%s] No arbitrage opportunity", pair)
 }
