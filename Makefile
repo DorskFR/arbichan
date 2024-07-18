@@ -6,10 +6,10 @@ DOCKER_IMAGE_TAG:=latest
 all: test build
 
 build:
-	$(GOBUILD) -o $(BINARY_NAME) -v
+	go build -o $(BINARY_NAME) -v
 
 test:
-	$(GOTEST) -v ./...
+	go test -v ./...
 
 clean:
 	go clean
