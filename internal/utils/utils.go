@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,4 +23,20 @@ func WaitForShutdownSignal(cancel context.CancelFunc) {
 	<-sigChan
 	log.Info().Msg("Shutting down gracefully...")
 	cancel()
+}
+
+func ShutdownWg(wg *sync.WaitGroup) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Info().Msg("All clients shut down successfully")
+	case <-time.After(10 * time.Second):
+		log.Warn().Msg("Timeout waiting for clients to shut down")
+	}
+
 }

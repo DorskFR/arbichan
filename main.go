@@ -21,8 +21,8 @@ func main() {
 		{
 			StandardSymbol: "BTC-USD",
 			ExchangePairs: []exchanges.ExchangePair{
-				{Exchange: "binance", Symbol: "BTCUSD"},
-				{Exchange: "kraken", Symbol: "XBT/USD"},
+				{Exchange: "binance", Symbol: "BTCUSDT"},
+				// {Exchange: "kraken", Symbol: "BTC/USD"},
 			},
 		},
 		// Add more pairs here as needed
@@ -37,7 +37,7 @@ func main() {
 	// Create exchange clients
 	exchangeClients := map[string]exchanges.ExchangeClient{
 		"binance": exchanges.NewBinanceClient(),
-		"kraken":  exchanges.NewKrakenClient(),
+		// "kraken":  exchanges.NewKrakenClient(),
 	}
 
 	// Create order books
@@ -47,8 +47,8 @@ func main() {
 	for _, pair := range pairs {
 		for _, ep := range pair.ExchangePairs {
 			key := fmt.Sprintf("%s:%s", ep.Exchange, ep.Symbol)
-			updateChan := make(chan orderbook.OrderBookUpdate, 100)
-			ob := orderbook.NewOrderBook(ep.Exchange, ep.Symbol, updateChan, majorUpdateChan)
+			updateChan := make(chan orderbook.PriceLevel, 100)
+			ob := orderbook.NewOrderBook(ep.Exchange, ep.Symbol, 10, updateChan, majorUpdateChan)
 			orderBooks[key] = ob
 			exchangeClients[ep.Exchange].RegisterOrderBook(ep.Symbol, ob)
 			detector.RegisterOrderBook(ep.Exchange, ep.Symbol, ob)
@@ -57,7 +57,6 @@ func main() {
 
 	// Create context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	// Start order book processors
 	for _, ob := range orderBooks {
@@ -77,8 +76,9 @@ func main() {
 
 	// Wait for shutdown signal
 	utils.WaitForShutdownSignal(cancel)
-	wg.Wait()
+	utils.ShutdownWg(&wg)
 	log.Info().Msg("Shutdown complete")
+
 }
 
 func runExchangeClient(ctx context.Context, wg *sync.WaitGroup, client exchanges.ExchangeClient, symbols []string) {

@@ -2,121 +2,169 @@ package orderbook
 
 import (
 	"context"
+	"sort"
 	"sync"
+
+	"github.com/shopspring/decimal"
 )
 
-type OrderBookUpdate struct {
-	Type   string // "bid" or "ask"
-	Price  float64
-	Amount float64
-}
-
+// MajorUpdate represents a significant change in the order book
 type MajorUpdate struct {
-	Exchange string
-	Symbol   string
+	Exchange string // Name of the exchange
+	Symbol   string // Trading pair symbol
 }
 
+// PriceLevel represents a single price level in the order book
+type PriceLevel struct {
+	Type      string // "bid" or "ask"
+	Price     decimal.Decimal
+	Amount    decimal.Decimal
+	PriceStr  string
+	AmountStr string
+}
+
+// OrderBook represents the full order book for a trading pair
 type OrderBook struct {
-	exchange     string
-	symbol       string
-	bids         map[float64]float64
-	asks         map[float64]float64
-	bestBid      float64
-	bestAsk      float64
-	mu           sync.RWMutex
-	Updates      chan OrderBookUpdate
-	MajorUpdates chan MajorUpdate
+	exchange           string
+	symbol             string
+	depth              int              // Maximum number of price levels to maintain
+	bids               []PriceLevel     // Sorted list of bid price levels
+	asks               []PriceLevel     // Sorted list of ask price levels
+	mu                 sync.RWMutex     // Mutex for thread-safe operations
+	Updates            chan PriceLevel  // Channel for receiving updates
+	MajorUpdates       chan MajorUpdate // Channel for sending notifications of major changes
+	ProcessingComplete chan struct{}    // Channel for signaling when all updates are processed
 }
 
-func NewOrderBook(exchange, symbol string, updateChan chan OrderBookUpdate, majorUpdateChan chan MajorUpdate) *OrderBook {
+// NewOrderBook creates and initializes a new OrderBook
+func NewOrderBook(exchange, symbol string, depth int, updateChan chan PriceLevel, majorUpdateChan chan MajorUpdate) *OrderBook {
 	return &OrderBook{
-		exchange:     exchange,
-		symbol:       symbol,
-		bids:         make(map[float64]float64),
-		asks:         make(map[float64]float64),
-		Updates:      updateChan,
-		MajorUpdates: majorUpdateChan,
+		exchange:           exchange,
+		symbol:             symbol,
+		depth:              depth,
+		bids:               make([]PriceLevel, 0),
+		asks:               make([]PriceLevel, 0),
+		Updates:            updateChan,
+		MajorUpdates:       majorUpdateChan,
+		ProcessingComplete: make(chan struct{}),
 	}
 }
 
+// Run starts the main loop of the OrderBook
 func (ob *OrderBook) Run(ctx context.Context) {
 	for {
 		select {
 		case update := <-ob.Updates:
-			if ob.applyUpdate(update) {
+			// Process all updates
+			ob.applyUpdate(update)
+		case <-ob.ProcessingComplete:
+		out:
+			for {
+				select {
+				case update := <-ob.Updates:
+					ob.applyUpdate(update)
+				default:
+					break out
+				}
+			}
+			if ob.reprocessLevels(&ob.bids, true) || ob.reprocessLevels(&ob.asks, false) {
+				// If it's a major change, send a notification
 				ob.MajorUpdates <- MajorUpdate{ob.exchange, ob.symbol}
 			}
+			// Signal that all pending updates have been processed
+			ob.ProcessingComplete <- struct{}{}
 		case <-ctx.Done():
+			// Exit the loop if the context is cancelled
 			return
 		}
 	}
 }
 
-func (ob *OrderBook) BestBidAsk() (float64, float64) {
+// GetTopLevels returns copies of the top bid and ask levels
+func (ob *OrderBook) GetTopLevels() ([]PriceLevel, []PriceLevel) {
 	ob.mu.RLock()
 	defer ob.mu.RUnlock()
-	return ob.bestBid, ob.bestAsk
+
+	// Create new slices to avoid exposing internal state
+	bids := make([]PriceLevel, len(ob.bids))
+	asks := make([]PriceLevel, len(ob.asks))
+
+	// Copy the current state of bids and asks
+	copy(bids, ob.bids)
+	copy(asks, ob.asks)
+
+	return bids, asks
 }
 
-func (ob *OrderBook) applyUpdate(update OrderBookUpdate) bool {
+// BestBidAsk returns the best bid and ask prices
+func (ob *OrderBook) BestBidAsk() (decimal.Decimal, decimal.Decimal) {
+	ob.mu.RLock()
+	defer ob.mu.RUnlock()
+
+	if len(ob.bids) > 0 && len(ob.asks) > 0 {
+		return ob.bids[0].Price, ob.asks[0].Price
+	}
+	return decimal.Zero, decimal.Zero // Return 0, 0 if there are no bids or asks
+}
+
+// applyUpdate applies a single update to the order book
+func (ob *OrderBook) applyUpdate(update PriceLevel) {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
-	var isMajor bool
-	switch update.Type {
-	case "bid":
-		isMajor = ob.updateBids(update.Price, update.Amount)
-	case "ask":
-		isMajor = ob.updateAsks(update.Price, update.Amount)
+	if update.Type == "bid" {
+		ob.updateLevels(update, &ob.bids)
+	} else if update.Type == "ask" {
+		ob.updateLevels(update, &ob.asks)
 	}
-
-	return isMajor
 }
 
-func (ob *OrderBook) updateBids(price, amount float64) bool {
-	if amount == 0 {
-		delete(ob.bids, price)
-	} else {
-		ob.bids[price] = amount
-	}
+// updateLevels updates either the bid or ask levels
+func (ob *OrderBook) updateLevels(update PriceLevel, levels *[]PriceLevel) {
 
-	newBestBid := getMaxKey(ob.bids)
-	isMajor := newBestBid != ob.bestBid
-	ob.bestBid = newBestBid
-	return isMajor
-}
-
-func (ob *OrderBook) updateAsks(price, amount float64) bool {
-	if amount == 0 {
-		delete(ob.asks, price)
-	} else {
-		ob.asks[price] = amount
-	}
-
-	newBestAsk := getMinKey(ob.asks)
-	isMajor := newBestAsk != ob.bestAsk
-	ob.bestAsk = newBestAsk
-	return isMajor
-}
-
-func getMaxKey(m map[float64]float64) float64 {
-	var max float64
-	for k := range m {
-		if k > max {
-			max = k
+	for i, level := range *levels {
+		if level.Price.Equal(update.Price) {
+			if update.Amount.IsZero() {
+				// Remove the level
+				*levels = append((*levels)[:i], (*levels)[i+1:]...)
+			} else {
+				// Update the existing level
+				(*levels)[i].Amount = update.Amount
+				(*levels)[i].AmountStr = update.AmountStr
+			}
+			return
 		}
 	}
-	return max
+
+	// If we're here, the price level doesn't exist
+	if !update.Amount.IsZero() {
+		// Append the new price level
+		*levels = append(*levels, update)
+	}
 }
 
-func getMinKey(m map[float64]float64) float64 {
-	var min float64
-	first := true
-	for k := range m {
-		if first || k < min {
-			min = k
-			first = false
-		}
+func (ob *OrderBook) reprocessLevels(levels *[]PriceLevel, isDescending bool) bool {
+	oldBest := decimal.Zero
+	if len(*levels) > 0 {
+		oldBest = (*levels)[0].Price
 	}
-	return min
+
+	sort.Slice(*levels, func(i, j int) bool {
+		if isDescending {
+			return (*levels)[i].Price.Compare((*levels)[j].Price) == 1 // Sort bids in descending order
+		}
+		return (*levels)[i].Price.Compare((*levels)[j].Price) == -1 // Sort asks in ascending order
+	})
+
+	// Truncate
+	if len(*levels) > ob.depth {
+		*levels = (*levels)[:ob.depth]
+	}
+
+	newBest := decimal.Zero
+	if len(*levels) > 0 {
+		newBest = (*levels)[0].Price
+	}
+
+	return !oldBest.Equal(newBest)
 }

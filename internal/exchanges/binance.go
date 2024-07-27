@@ -4,18 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
-	"strconv"
 	"sync"
 	"time"
 
 	"github.com/dorskfr/arbichan/internal/orderbook"
 	"github.com/gorilla/websocket"
+	"github.com/rs/zerolog/log"
+	"github.com/shopspring/decimal"
 )
 
 const (
-	binanceStreamWSURL = "wss://stream.binance.com:9443/ws"
 	binanceAPIWSURL    = "wss://ws-api.binance.com:443/ws-api/v3"
+	binanceStreamWSURL = "wss://stream.binance.com:9443/ws"
 )
 
 type BinanceClient struct {
@@ -37,6 +37,12 @@ type binanceWSResponse struct {
 	ID     int             `json:"id"`
 	Status int             `json:"status"`
 	Result json.RawMessage `json:"result"`
+}
+
+type BinanceSubscriptionRequest struct {
+	Method string   `json:"method"`
+	Params []string `json:"params"`
+	ID     int      `json:"id"`
 }
 
 type binanceDepthSnapshot struct {
@@ -83,6 +89,7 @@ func (c *BinanceClient) Connect() error {
 }
 
 func (c *BinanceClient) Disconnect() {
+	log.Info().Str("exchange", c.name).Msg("Disconnecting")
 	if c.streamConn != nil {
 		c.streamConn.Close()
 	}
@@ -117,17 +124,13 @@ func (c *BinanceClient) Subscribe(symbols []string) error {
 		streamParams[i] = fmt.Sprintf("%s@depth@100ms", symbol)
 	}
 
-	subscribeMsg := struct {
-		Method string   `json:"method"`
-		Params []string `json:"params"`
-		ID     int      `json:"id"`
-	}{
+	subscription := BinanceSubscriptionRequest{
 		Method: "SUBSCRIBE",
 		Params: streamParams,
 		ID:     1,
 	}
 
-	if err := c.streamConn.WriteJSON(subscribeMsg); err != nil {
+	if err := c.streamConn.WriteJSON(subscription); err != nil {
 		return fmt.Errorf("error subscribing to depth streams: %w", err)
 	}
 
@@ -147,7 +150,12 @@ func (c *BinanceClient) ReadMessages(ctx context.Context) error {
 
 			var update binanceDepthUpdate
 			if err := json.Unmarshal(message, &update); err != nil {
-				log.Printf("Error unmarshalling message: %v", err)
+				log.Error().Err(err).Str("exchange", c.name).Msg("Error unmarshalling message")
+				continue
+			}
+
+			if update.Symbol == "" {
+				log.Error().Str("exchange", c.name).Str("message", string(message)).Msg("The message was not parsed correctly")
 				continue
 			}
 
@@ -162,10 +170,11 @@ func (c *BinanceClient) getDepthSnapshot(symbol string) error {
 		Method: "depth",
 		Params: map[string]interface{}{
 			"symbol": symbol,
-			"limit":  1000,
+			"limit":  5,
 		},
 	}
 
+	log.Debug().Str("exchange", c.name).Str("symbol", symbol).Msg("Requesting depth snapshot")
 	if err := c.apiConn.WriteJSON(req); err != nil {
 		return fmt.Errorf("error requesting depth snapshot: %w", err)
 	}
@@ -195,23 +204,23 @@ func (c *BinanceClient) applyDepthSnapshot(symbol string, snapshot *binanceDepth
 
 	ob, exists := c.orderBooks[symbol]
 	if !exists {
-		log.Printf("Order book for symbol %s not found", symbol)
+		log.Warn().Str("exchange", c.name).Str("symbol", symbol).Msg("Order book not found for symbol")
 		return
 	}
 
-	// Clear existing order book data
-	ob.Updates <- orderbook.OrderBookUpdate{Type: "clear"}
+	// TODO: Clear existing order book data. Not handled yet.
+	ob.Updates <- orderbook.PriceLevel{Type: "clear"}
 
 	// Apply snapshot data
 	for _, bid := range snapshot.Bids {
-		price, _ := strconv.ParseFloat(bid[0], 64)
-		amount, _ := strconv.ParseFloat(bid[1], 64)
-		ob.Updates <- orderbook.OrderBookUpdate{Type: "bid", Price: price, Amount: amount}
+		price, _ := decimal.NewFromString(bid[0])
+		amount, _ := decimal.NewFromString(bid[1])
+		ob.Updates <- orderbook.PriceLevel{Type: "bid", Price: price, Amount: amount, PriceStr: price.String(), AmountStr: amount.String()}
 	}
 	for _, ask := range snapshot.Asks {
-		price, _ := strconv.ParseFloat(ask[0], 64)
-		amount, _ := strconv.ParseFloat(ask[1], 64)
-		ob.Updates <- orderbook.OrderBookUpdate{Type: "ask", Price: price, Amount: amount}
+		price, _ := decimal.NewFromString(ask[0])
+		amount, _ := decimal.NewFromString(ask[1])
+		ob.Updates <- orderbook.PriceLevel{Type: "ask", Price: price, Amount: amount, PriceStr: price.String(), AmountStr: amount.String()}
 	}
 
 	c.lastUpdateIDs[symbol] = snapshot.LastUpdateID
@@ -223,11 +232,13 @@ func (c *BinanceClient) handleDepthUpdate(update binanceDepthUpdate) {
 
 	ob, exists := c.orderBooks[update.Symbol]
 	if !exists {
+		log.Warn().Str("exchange", c.name).Str("symbol", update.Symbol).Msg("Order book not found for symbol")
 		return
 	}
 
 	lastUpdateID, exists := c.lastUpdateIDs[update.Symbol]
 	if !exists {
+		log.Warn().Str("exchange", c.name).Str("symbol", update.Symbol).Msg("Last update ID not found for symbol")
 		return
 	}
 
@@ -239,22 +250,22 @@ func (c *BinanceClient) handleDepthUpdate(update binanceDepthUpdate) {
 		return
 	} else {
 		// We've missed some updates, need to resync
-		log.Printf("Missed updates for %s, resyncing", update.Symbol)
+		log.Warn().Str("exchange", c.name).Str("symbol", update.Symbol).Msg("Missed updates, resyncing")
 		if err := c.getDepthSnapshot(update.Symbol); err != nil {
-			log.Printf("Error resyncing %s: %v", update.Symbol, err)
+			log.Error().Str("exchange", c.name).Str("symbol", update.Symbol).Msg("Error resyncing")
 		}
 	}
 }
 
 func (c *BinanceClient) applyDepthUpdate(ob *orderbook.OrderBook, update binanceDepthUpdate) {
 	for _, bid := range update.Bids {
-		price, _ := strconv.ParseFloat(bid[0], 64)
-		amount, _ := strconv.ParseFloat(bid[1], 64)
-		ob.Updates <- orderbook.OrderBookUpdate{Type: "bid", Price: price, Amount: amount}
+		price, _ := decimal.NewFromString(bid[0])
+		amount, _ := decimal.NewFromString(bid[1])
+		ob.Updates <- orderbook.PriceLevel{Type: "bid", Price: price, Amount: amount, PriceStr: price.String(), AmountStr: amount.String()}
 	}
 	for _, ask := range update.Asks {
-		price, _ := strconv.ParseFloat(ask[0], 64)
-		amount, _ := strconv.ParseFloat(ask[1], 64)
-		ob.Updates <- orderbook.OrderBookUpdate{Type: "ask", Price: price, Amount: amount}
+		price, _ := decimal.NewFromString(ask[0])
+		amount, _ := decimal.NewFromString(ask[1])
+		ob.Updates <- orderbook.PriceLevel{Type: "ask", Price: price, Amount: amount, PriceStr: price.String(), AmountStr: amount.String()}
 	}
 }

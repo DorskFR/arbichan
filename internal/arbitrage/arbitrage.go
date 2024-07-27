@@ -98,23 +98,23 @@ func (ad *ArbitrageDetector) compareExchanges(pairSymbol string, ep1, ep2 exchan
 	bestBid1, bestAsk1 := ob1.BestBidAsk()
 	bestBid2, bestAsk2 := ob2.BestBidAsk()
 
-	if bestBid1 > bestAsk2 {
-		profit := bestBid1 - bestAsk2
+	if bestBid1.GreaterThan(bestAsk2) {
+		profit := bestBid1.Sub(bestAsk2)
 		log.Info().
 			Str("pair", pairSymbol).
 			Str("buy", ep2.Exchange).
 			Str("sell", ep1.Exchange).
-			Float64("profit", profit).
+			Str("profit", profit.String()).
 			Msg("Arbitrage opportunity detected")
 	}
 
-	if bestBid2 > bestAsk1 {
-		profit := bestBid2 - bestAsk1
+	if bestBid2.GreaterThan(bestAsk1) {
+		profit := bestBid2.Sub(bestAsk1)
 		log.Info().
 			Str("pair", pairSymbol).
 			Str("buy", ep1.Exchange).
 			Str("sell", ep2.Exchange).
-			Float64("profit", profit).
+			Str("profit", profit.String()).
 			Msg("Arbitrage opportunity detected")
 	}
 }
