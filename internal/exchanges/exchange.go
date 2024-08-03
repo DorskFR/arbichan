@@ -4,11 +4,13 @@ import (
 	"context"
 
 	"github.com/dorskfr/arbichan/internal/orderbook"
+	"github.com/shopspring/decimal"
 )
 
 type Pair struct {
-	StandardSymbol string
-	ExchangePairs  []ExchangePair
+	StandardSymbol  string
+	ExchangePairs   []ExchangePair
+	ProfitThreshold decimal.Decimal
 }
 
 type ExchangePair struct {

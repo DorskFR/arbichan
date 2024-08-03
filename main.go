@@ -24,8 +24,8 @@ func main() {
 				{Exchange: "binance", Symbol: "BTCUSDT"},
 				// {Exchange: "kraken", Symbol: "BTC/USD"},
 			},
+			ProfitThreshold: decimal.NewFromFloat32(0.50),
 		},
-		// Add more pairs here as needed
 	}
 
 	// Create channels for updates
@@ -53,6 +53,7 @@ func main() {
 			exchangeClients[ep.Exchange].RegisterOrderBook(ep.Symbol, ob)
 			detector.RegisterOrderBook(ep.Exchange, ep.Symbol, ob)
 		}
+		detector.SetProfitThreshold(pair.StandardSymbol, pair.ProfitThreshold)
 	}
 
 	// Create context with cancellation
