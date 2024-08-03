@@ -4,9 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/dorskfr/arbichan/internal/messagetracker"
 	"github.com/dorskfr/arbichan/internal/orderbook"
 	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog/log"
@@ -14,17 +18,17 @@ import (
 )
 
 const (
-	binanceAPIWSURL    = "wss://ws-api.binance.com:443/ws-api/v3"
+	binanceAPIRestURL  = "https://api.binance.com/api/v3"
 	binanceStreamWSURL = "wss://stream.binance.com:9443/ws"
 )
 
 type BinanceClient struct {
-	name          string
-	streamConn    *websocket.Conn
-	apiConn       *websocket.Conn
-	orderBooks    map[string]*orderbook.OrderBook
-	mu            sync.RWMutex
-	lastUpdateIDs map[string]int64
+	name           string
+	conn           *websocket.Conn
+	orderBooks     map[string]*orderbook.OrderBook
+	messagetracker *messagetracker.MessageTracker
+	mu             sync.RWMutex
+	lastUpdateIDs  map[string]int64
 }
 
 type binanceWSRequest struct {
@@ -37,12 +41,6 @@ type binanceWSResponse struct {
 	ID     int             `json:"id"`
 	Status int             `json:"status"`
 	Result json.RawMessage `json:"result"`
-}
-
-type BinanceSubscriptionRequest struct {
-	Method string   `json:"method"`
-	Params []string `json:"params"`
-	ID     int      `json:"id"`
 }
 
 type binanceDepthSnapshot struct {
@@ -63,9 +61,10 @@ type binanceDepthUpdate struct {
 
 func NewBinanceClient() *BinanceClient {
 	return &BinanceClient{
-		name:          "binance",
-		orderBooks:    make(map[string]*orderbook.OrderBook),
-		lastUpdateIDs: make(map[string]int64),
+		name:           "binance",
+		orderBooks:     make(map[string]*orderbook.OrderBook),
+		lastUpdateIDs:  make(map[string]int64),
+		messagetracker: messagetracker.NewMessageTracker("binance", time.Minute),
 	}
 }
 
@@ -74,27 +73,18 @@ func (c *BinanceClient) Name() string {
 }
 
 func (c *BinanceClient) Connect() error {
-	var err error
-	c.streamConn, _, err = websocket.DefaultDialer.Dial(binanceStreamWSURL, nil)
+	conn, _, err := websocket.DefaultDialer.Dial(binanceStreamWSURL, nil)
 	if err != nil {
 		return fmt.Errorf("error connecting to Binance Stream WebSocket: %w", err)
 	}
-
-	c.apiConn, _, err = websocket.DefaultDialer.Dial(binanceAPIWSURL, nil)
-	if err != nil {
-		return fmt.Errorf("error connecting to Binance API WebSocket: %w", err)
-	}
-
+	c.conn = conn
 	return nil
 }
 
 func (c *BinanceClient) Disconnect() {
 	log.Info().Str("exchange", c.name).Msg("Disconnecting")
-	if c.streamConn != nil {
-		c.streamConn.Close()
-	}
-	if c.apiConn != nil {
-		c.apiConn.Close()
+	if c.conn != nil {
+		c.conn.Close()
 	}
 }
 
@@ -102,6 +92,7 @@ func (c *BinanceClient) RegisterOrderBook(symbol string, ob *orderbook.OrderBook
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.orderBooks[symbol] = ob
+	log.Info().Str("exchange", c.name).Str("symbol", symbol).Msg("Registering orderbook")
 }
 
 func (c *BinanceClient) GetOrderBook(symbol string) *orderbook.OrderBook {
@@ -111,86 +102,116 @@ func (c *BinanceClient) GetOrderBook(symbol string) *orderbook.OrderBook {
 }
 
 func (c *BinanceClient) Subscribe(symbols []string) error {
+	streamParams := make([]string, len(symbols))
+	for i, symbol := range symbols {
+		streamParams[i] = fmt.Sprintf("%s@depth@100ms", strings.ToLower(symbol))
+	}
+
+	subscribeReq := binanceWSRequest{
+		ID:     time.Now().Nanosecond(),
+		Method: "SUBSCRIBE",
+		Params: streamParams,
+	}
+
+	if err := c.conn.WriteJSON(subscribeReq); err != nil {
+		return fmt.Errorf("error subscribing to depth streams: %w", err)
+	}
+
+	// Wait for subscription confirmation
+	_, msg, err := c.conn.ReadMessage()
+	if err != nil {
+		return fmt.Errorf("error reading subscription response: %w", err)
+	}
+
+	var response binanceWSResponse
+	if err := json.Unmarshal(msg, &response); err != nil {
+		return fmt.Errorf("error unmarshalling subscription response: %w", err)
+	}
+
+	// On succesful subscription we just receive a `null` message with the ID of the request
+	if response.ID == subscribeReq.ID {
+		log.Info().Str("exchange", c.name).Msg("Successfully subscribed to depth streams")
+	} else {
+		return fmt.Errorf("unexpected subscription response for %s", response.Result)
+	}
+
+	// Get initial order book snapshots
 	for _, symbol := range symbols {
-		// First, get the depth snapshot
 		if err := c.getDepthSnapshot(symbol); err != nil {
 			return fmt.Errorf("error getting depth snapshot for %s: %w", symbol, err)
 		}
 	}
 
-	// Then, subscribe to the depth stream
-	streamParams := make([]string, len(symbols))
-	for i, symbol := range symbols {
-		streamParams[i] = fmt.Sprintf("%s@depth@100ms", symbol)
-	}
-
-	subscription := BinanceSubscriptionRequest{
-		Method: "SUBSCRIBE",
-		Params: streamParams,
-		ID:     1,
-	}
-
-	if err := c.streamConn.WriteJSON(subscription); err != nil {
-		return fmt.Errorf("error subscribing to depth streams: %w", err)
-	}
-
 	return nil
 }
 
+// Main function to read messages
 func (c *BinanceClient) ReadMessages(ctx context.Context) error {
+	messagetrackerTicker := time.NewTicker(time.Minute)
+	defer messagetrackerTicker.Stop()
+
 	for {
 		select {
+		// Stop when context is cancelled
 		case <-ctx.Done():
 			return ctx.Err()
+		// Check if the last message received is not too old
+		case <-messagetrackerTicker.C:
+			c.messagetracker.CheckStaleConnection()
+		// Otherwise process
 		default:
-			_, message, err := c.streamConn.ReadMessage()
+			messageType, message, err := c.conn.ReadMessage()
 			if err != nil {
 				return fmt.Errorf("error reading message: %w", err)
 			}
 
-			var update binanceDepthUpdate
-			if err := json.Unmarshal(message, &update); err != nil {
-				log.Error().Err(err).Str("exchange", c.name).Msg("Error unmarshalling message")
-				continue
-			}
+			// Refresh the messagetracker last message time
+			c.messagetracker.RecordMessage()
 
-			if update.Symbol == "" {
-				log.Error().Str("exchange", c.name).Str("message", string(message)).Msg("The message was not parsed correctly")
-				continue
-			}
+			switch messageType {
+			case websocket.PingMessage:
+				// Binance pings every 3 min, respond to ping with a pong
+				if err := c.conn.WriteMessage(websocket.PongMessage, message); err != nil {
+					log.Warn().Err(err).Str("exchange", c.name).Msg("Failed to send pong")
+					return fmt.Errorf("error sending pong: %w", err)
+				}
+				log.Debug().Str("exchange", c.name).Msg("Received ping, sent pong")
+			case websocket.TextMessage:
+				var update binanceDepthUpdate
+				if err := json.Unmarshal(message, &update); err != nil {
+					log.Error().Err(err).Str("exchange", c.name).Msg("Error unmarshalling message")
+					continue
+				}
 
-			c.handleDepthUpdate(update)
+				if update.Symbol == "" {
+					log.Error().Str("exchange", c.name).Str("message", string(message)).Msg("The message was not parsed correctly")
+					continue
+				}
+
+				c.handleDepthUpdate(update)
+			default:
+				log.Warn().Str("exchange", c.name).Int("messageType", messageType).Msg("Received unexpected message type")
+			}
 		}
 	}
 }
 
 func (c *BinanceClient) getDepthSnapshot(symbol string) error {
-	req := binanceWSRequest{
-		ID:     time.Now().Nanosecond(),
-		Method: "depth",
-		Params: map[string]interface{}{
-			"symbol": symbol,
-			"limit":  5,
-		},
-	}
+	url := fmt.Sprintf("%s/depth?symbol=%s&limit=10", binanceAPIRestURL, symbol)
 
-	log.Debug().Str("exchange", c.name).Str("symbol", symbol).Msg("Requesting depth snapshot")
-	if err := c.apiConn.WriteJSON(req); err != nil {
+	resp, err := http.Get(url)
+	if err != nil {
 		return fmt.Errorf("error requesting depth snapshot: %w", err)
 	}
+	defer resp.Body.Close()
 
-	_, msg, err := c.apiConn.ReadMessage()
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("error reading depth snapshot response: %w", err)
 	}
 
-	var resp binanceWSResponse
-	if err := json.Unmarshal(msg, &resp); err != nil {
-		return fmt.Errorf("error unmarshalling depth snapshot response: %w", err)
-	}
-
 	var snapshot binanceDepthSnapshot
-	if err := json.Unmarshal(resp.Result, &snapshot); err != nil {
+	if err := json.Unmarshal(body, &snapshot); err != nil {
 		return fmt.Errorf("error unmarshalling depth snapshot data: %w", err)
 	}
 
@@ -242,30 +263,54 @@ func (c *BinanceClient) handleDepthUpdate(update binanceDepthUpdate) {
 		return
 	}
 
-	if update.FirstUpdateID <= lastUpdateID+1 && update.FinalUpdateID >= lastUpdateID+1 {
-		c.applyDepthUpdate(ob, update)
-		c.lastUpdateIDs[update.Symbol] = update.FinalUpdateID
-	} else if update.FinalUpdateID < lastUpdateID+1 {
-		// Discard this update
-		return
-	} else {
+	if update.FirstUpdateID > lastUpdateID+1 {
 		// We've missed some updates, need to resync
 		log.Warn().Str("exchange", c.name).Str("symbol", update.Symbol).Msg("Missed updates, resyncing")
 		if err := c.getDepthSnapshot(update.Symbol); err != nil {
-			log.Error().Str("exchange", c.name).Str("symbol", update.Symbol).Msg("Error resyncing")
+			log.Error().Err(err).Str("exchange", c.name).Str("symbol", update.Symbol).Msg("Error resyncing")
 		}
+		return
 	}
+
+	if update.FinalUpdateID <= lastUpdateID {
+		// Discard this update as it's older than what we have
+		return
+	}
+
+	// Apply the update
+	c.applyDepthUpdate(ob, update)
+
+	// Ensure all updates are processed
+	ob.ProcessingComplete <- struct{}{}
+	<-ob.ProcessingComplete
+
+	c.lastUpdateIDs[update.Symbol] = update.FinalUpdateID
+
 }
 
 func (c *BinanceClient) applyDepthUpdate(ob *orderbook.OrderBook, update binanceDepthUpdate) {
 	for _, bid := range update.Bids {
 		price, _ := decimal.NewFromString(bid[0])
 		amount, _ := decimal.NewFromString(bid[1])
-		ob.Updates <- orderbook.PriceLevel{Type: "bid", Price: price, Amount: amount, PriceStr: price.String(), AmountStr: amount.String()}
+		priceLevel := orderbook.PriceLevel{
+			Type:      "bid",
+			Price:     price,
+			Amount:    amount,
+			PriceStr:  price.String(),
+			AmountStr: amount.String(),
+		}
+		ob.Updates <- priceLevel
 	}
 	for _, ask := range update.Asks {
 		price, _ := decimal.NewFromString(ask[0])
 		amount, _ := decimal.NewFromString(ask[1])
-		ob.Updates <- orderbook.PriceLevel{Type: "ask", Price: price, Amount: amount, PriceStr: price.String(), AmountStr: amount.String()}
+		priceLevel := orderbook.PriceLevel{
+			Type:      "ask",
+			Price:     price,
+			Amount:    amount,
+			PriceStr:  price.String(),
+			AmountStr: amount.String(),
+		}
+		ob.Updates <- priceLevel
 	}
 }
