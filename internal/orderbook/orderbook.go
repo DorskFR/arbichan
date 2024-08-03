@@ -121,7 +121,6 @@ func (ob *OrderBook) applyUpdate(update PriceLevel) {
 
 // updateLevels updates either the bid or ask levels
 func (ob *OrderBook) updateLevels(update PriceLevel, levels *[]PriceLevel) {
-
 	for i, level := range *levels {
 		if level.Price.Equal(update.Price) {
 			if update.Amount.IsZero() {

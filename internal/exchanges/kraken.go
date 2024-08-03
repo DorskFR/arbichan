@@ -7,7 +7,9 @@ import (
 	"hash/crc32"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/dorskfr/arbichan/internal/messagetracker"
 	"github.com/dorskfr/arbichan/internal/orderbook"
 	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog/log"
@@ -20,7 +22,7 @@ const (
 	krakenWSURL = "wss://ws.kraken.com/v2"
 )
 
-// Should fit the different messages sent
+// Should fit the different messages we can receive
 type krakenMessage struct {
 	Channel string                `json:"channel,omitempty"`
 	Data    json.RawMessage       `json:"data,omitempty"`
@@ -31,7 +33,8 @@ type krakenMessage struct {
 	Type    string                `json:"type,omitempty"`
 }
 
-type krakenBookData struct {
+// Order book data updates are in this format
+type krakenBookUpdate struct {
 	Asks      []priceQty `json:"asks,omitempty"`
 	Bids      []priceQty `json:"bids,omitempty"`
 	Checksum  int64      `json:"checksum"`
@@ -39,6 +42,7 @@ type krakenBookData struct {
 	Timestamp string     `json:"timestamp,omitempty"`
 }
 
+// Represents a single price and we keep the String representation as this keeps the precision to calculate the checksum
 type priceQty struct {
 	Price    decimal.Decimal `json:"price"`
 	Qty      decimal.Decimal `json:"qty"`
@@ -89,16 +93,18 @@ type krakenSubscriptionAck struct {
 	Symbol   string `json:"symbol"`
 }
 type KrakenClient struct {
-	name       string
-	conn       *websocket.Conn
-	orderBooks map[string]*orderbook.OrderBook
-	mu         sync.RWMutex
+	name           string
+	conn           *websocket.Conn
+	orderBooks     map[string]*orderbook.OrderBook
+	messagetracker *messagetracker.MessageTracker
+	mu             sync.RWMutex
 }
 
 func NewKrakenClient() *KrakenClient {
 	return &KrakenClient{
-		name:       "kraken",
-		orderBooks: make(map[string]*orderbook.OrderBook),
+		name:           "kraken",
+		orderBooks:     make(map[string]*orderbook.OrderBook),
+		messagetracker: messagetracker.NewMessageTracker("kraken", time.Minute),
 	}
 }
 
@@ -116,6 +122,7 @@ func (c *KrakenClient) Connect() error {
 }
 
 func (c *KrakenClient) Disconnect() {
+	log.Info().Str("exchange", c.name).Msg("Disconnecting")
 	if c.conn != nil {
 		c.conn.Close()
 	}
@@ -125,6 +132,7 @@ func (c *KrakenClient) RegisterOrderBook(symbol string, ob *orderbook.OrderBook)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.orderBooks[symbol] = ob
+	log.Info().Str("exchange", c.name).Str("symbol", symbol).Msg("Registering orderbook")
 }
 
 func (c *KrakenClient) GetOrderBook(symbol string) *orderbook.OrderBook {
@@ -141,20 +149,38 @@ func (c *KrakenClient) Subscribe(pairs []string) error {
 			Symbol:  pairs,
 		},
 	}
-	log.Debug().Str("exchange", c.name).Interface("subscription", subscription).Msg("Sending subscription request")
+	log.Info().Str("exchange", c.name).Interface("subscription", subscription).Msg("Sending subscription request")
 	return c.conn.WriteJSON(subscription)
 }
 
+// Main function to read messages and keep the connection alive
 func (c *KrakenClient) ReadMessages(ctx context.Context) error {
+	pingTicker := time.NewTicker(50 * time.Second)
+	defer pingTicker.Stop()
+
 	for {
 		select {
+		// Exit when context is cancelled
 		case <-ctx.Done():
 			return ctx.Err()
+		// Send a ping to keep the connection alive
+		case <-pingTicker.C:
+			if err := c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
+				log.Warn().Err(err).Str("exchange", c.name).Msg("Failed to send ping")
+				return fmt.Errorf("failed to send ping: %w", err)
+			}
+			// Also trigger the messageTracker to check if the connection has disconnected / gone stale
+			c.messagetracker.CheckStaleConnection()
+
+		// Otherwise receive messages
 		default:
 			_, message, err := c.conn.ReadMessage()
 			if err != nil {
 				return fmt.Errorf("error reading message: %w", err)
 			}
+
+			// Update the tracker to signal the connection is active
+			c.messagetracker.RecordMessage()
 
 			var msg krakenMessage
 			if err := json.Unmarshal(message, &msg); err != nil {
@@ -165,8 +191,9 @@ func (c *KrakenClient) ReadMessages(ctx context.Context) error {
 			switch {
 			case msg.Error != "":
 				log.Error().Str("error", msg.Error).Msg("Could not subscribe")
+			// Process order book updates
 			case msg.Channel == "book":
-				var updates []krakenBookData
+				var updates []krakenBookUpdate
 				if err := json.Unmarshal(msg.Data, &updates); err != nil {
 					log.Error().Err(err).Str("exchange", c.name).Str("msgData", string(msg.Data)).Msg("Error unmarshalling book data")
 					continue
@@ -174,12 +201,12 @@ func (c *KrakenClient) ReadMessages(ctx context.Context) error {
 				for _, update := range updates {
 					c.applyBookUpdate(update)
 				}
-			case msg.Channel == "status":
-				log.Debug().Str("exchange", c.name).Msg("System status update")
-			case msg.Channel == "heartbeat":
-				log.Debug().Str("exchange", c.name).Msg("Heartbeat received")
 			case msg.Method == "subscribe" && *msg.Success:
 				log.Info().Str("exchange", c.name).Str("channel", msg.Result.Channel).Str("symbol", msg.Result.Symbol).Msg("Subscription successful")
+			// just silence those
+			case msg.Channel == "status":
+			case msg.Channel == "pong":
+			case msg.Channel == "heartbeat":
 			default:
 				log.Warn().Str("exchange", c.name).Str("rawMessage", string(message)).Msg("Unhandled message type")
 			}
@@ -187,27 +214,27 @@ func (c *KrakenClient) ReadMessages(ctx context.Context) error {
 	}
 }
 
-func (c *KrakenClient) applyBookUpdate(data krakenBookData) {
+func (c *KrakenClient) applyBookUpdate(update krakenBookUpdate) {
 
 	// Check that we can apply the message
 	c.mu.RLock()
-	ob, exists := c.orderBooks[data.Symbol]
+	ob, exists := c.orderBooks[update.Symbol]
 	c.mu.RUnlock()
 	if !exists {
-		log.Warn().Str("exchange", c.name).Str("pair", data.Symbol).Msg("Order book not found for pair")
+		log.Warn().Str("exchange", c.name).Str("pair", update.Symbol).Msg("Order book not found for pair")
 		return
 	}
 
 	// Send the Asks and Bids updates
-	c.sendOrderBookUpdates(ob, data.Asks, "ask")
-	c.sendOrderBookUpdates(ob, data.Bids, "bid")
+	c.sendOrderBookUpdates(ob, update.Asks, "ask")
+	c.sendOrderBookUpdates(ob, update.Bids, "bid")
 
 	// Ensure all updates are processed
 	ob.ProcessingComplete <- struct{}{}
 	<-ob.ProcessingComplete
 
-	if !c.verifyChecksum(ob, data.Checksum) {
-		log.Error().Str("exchange", c.name).Str("pair", data.Symbol).Msg("Checksum verification failed")
+	if !c.verifyChecksum(ob, update.Checksum) {
+		log.Error().Str("exchange", c.name).Str("pair", update.Symbol).Msg("Checksum verification failed")
 		// TODO: Wipe the orderbook and request a new snapshot
 	}
 }
@@ -221,16 +248,10 @@ func (c *KrakenClient) sendOrderBookUpdates(ob *orderbook.OrderBook, updates []p
 			PriceStr:  update.PriceStr,
 			AmountStr: update.QtyStr,
 		}
-
-		log.Debug().
-			Str("exchange", c.name).
-			Str("type", updateType).
-			Str("price", update.PriceStr).
-			Str("amount", update.QtyStr).
-			Msg("Sending order book update")
 	}
 }
 
+// If this fails, we have an orderbook that might be invalid
 func (c *KrakenClient) verifyChecksum(ob *orderbook.OrderBook, receivedChecksum int64) bool {
 	bids, asks := ob.GetTopLevels()
 	checksumString := c.generateChecksumString(bids, asks)
