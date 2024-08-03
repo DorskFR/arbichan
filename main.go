@@ -10,6 +10,7 @@ import (
 	"github.com/dorskfr/arbichan/internal/orderbook"
 	"github.com/dorskfr/arbichan/internal/utils"
 	"github.com/rs/zerolog/log"
+	"github.com/shopspring/decimal"
 )
 
 func main() {
@@ -22,7 +23,8 @@ func main() {
 			StandardSymbol: "BTC-USD",
 			ExchangePairs: []exchanges.ExchangePair{
 				{Exchange: "binance", Symbol: "BTCUSDT"},
-				// {Exchange: "kraken", Symbol: "BTC/USD"},
+				{Exchange: "kraken", Symbol: "BTC/USD"},
+				{Exchange: "poloniex", Symbol: "BTC_USDT"},
 			},
 			ProfitThreshold: decimal.NewFromFloat32(0.50),
 		},
@@ -36,8 +38,9 @@ func main() {
 
 	// Create exchange clients
 	exchangeClients := map[string]exchanges.ExchangeClient{
-		"binance": exchanges.NewBinanceClient(),
-		// "kraken":  exchanges.NewKrakenClient(),
+		"binance":  exchanges.NewBinanceClient(),
+		"kraken":   exchanges.NewKrakenClient(),
+		"poloniex": exchanges.NewPoloniexClient(),
 	}
 
 	// Create order books
