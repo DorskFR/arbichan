@@ -215,11 +215,11 @@ func (c *BinanceClient) getDepthSnapshot(symbol string) error {
 		return fmt.Errorf("error unmarshalling depth snapshot data: %w", err)
 	}
 
-	c.applyDepthSnapshot(symbol, &snapshot)
+	c.handleDepthSnapshot(symbol, &snapshot)
 	return nil
 }
 
-func (c *BinanceClient) applyDepthSnapshot(symbol string, snapshot *binanceDepthSnapshot) {
+func (c *BinanceClient) handleDepthSnapshot(symbol string, snapshot *binanceDepthSnapshot) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -233,16 +233,11 @@ func (c *BinanceClient) applyDepthSnapshot(symbol string, snapshot *binanceDepth
 	ob.Updates <- orderbook.PriceLevel{Type: "clear"}
 
 	// Apply snapshot data
-	for _, bid := range snapshot.Bids {
-		price, _ := decimal.NewFromString(bid[0])
-		amount, _ := decimal.NewFromString(bid[1])
-		ob.Updates <- orderbook.PriceLevel{Type: "bid", Price: price, Amount: amount, PriceStr: price.String(), AmountStr: amount.String()}
-	}
-	for _, ask := range snapshot.Asks {
-		price, _ := decimal.NewFromString(ask[0])
-		amount, _ := decimal.NewFromString(ask[1])
-		ob.Updates <- orderbook.PriceLevel{Type: "ask", Price: price, Amount: amount, PriceStr: price.String(), AmountStr: amount.String()}
-	}
+	c.applyDepthUpdate(ob, snapshot.Bids, snapshot.Asks)
+
+	// Ensure all updates are processed
+	ob.ProcessingComplete <- struct{}{}
+	<-ob.ProcessingComplete
 
 	c.lastUpdateIDs[symbol] = snapshot.LastUpdateID
 }
@@ -278,7 +273,7 @@ func (c *BinanceClient) handleDepthUpdate(update binanceDepthUpdate) {
 	}
 
 	// Apply the update
-	c.applyDepthUpdate(ob, update)
+	c.applyDepthUpdate(ob, update.Bids, update.Asks)
 
 	// Ensure all updates are processed
 	ob.ProcessingComplete <- struct{}{}
@@ -288,8 +283,8 @@ func (c *BinanceClient) handleDepthUpdate(update binanceDepthUpdate) {
 
 }
 
-func (c *BinanceClient) applyDepthUpdate(ob *orderbook.OrderBook, update binanceDepthUpdate) {
-	for _, bid := range update.Bids {
+func (c *BinanceClient) applyDepthUpdate(ob *orderbook.OrderBook, bids [][]string, asks [][]string) {
+	for _, bid := range bids {
 		price, _ := decimal.NewFromString(bid[0])
 		amount, _ := decimal.NewFromString(bid[1])
 		priceLevel := orderbook.PriceLevel{
@@ -301,7 +296,7 @@ func (c *BinanceClient) applyDepthUpdate(ob *orderbook.OrderBook, update binance
 		}
 		ob.Updates <- priceLevel
 	}
-	for _, ask := range update.Asks {
+	for _, ask := range asks {
 		price, _ := decimal.NewFromString(ask[0])
 		amount, _ := decimal.NewFromString(ask[1])
 		priceLevel := orderbook.PriceLevel{
