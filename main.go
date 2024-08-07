@@ -87,16 +87,20 @@ func main() {
 
 func runExchangeClient(ctx context.Context, wg *sync.WaitGroup, client exchanges.ExchangeClient, symbols []string) {
 	defer wg.Done()
+	var disconnected bool
 
 	for {
 		select {
 		case <-ctx.Done():
 			log.Info().Str("exchange", client.Name()).Msg("Context cancelled, shutting down client")
-			client.Disconnect()
+			if !disconnected {
+				client.Disconnect()
+				disconnected = true
+			}
 			return
 		default:
 			log.Info().Str("exchange", client.Name()).Msg("Attempting to connect")
-			if err := client.Connect(); err != nil {
+			if err := client.Connect(ctx); err != nil {
 				log.Error().Err(err).Str("exchange", client.Name()).Msg("Failed to connect")
 				continue
 			}
@@ -104,14 +108,20 @@ func runExchangeClient(ctx context.Context, wg *sync.WaitGroup, client exchanges
 			log.Info().Str("exchange", client.Name()).Msg("Connected successfully, subscribing to symbols")
 			if err := client.Subscribe(symbols); err != nil {
 				log.Error().Err(err).Str("exchange", client.Name()).Msg("Failed to subscribe")
-				client.Disconnect()
+				if !disconnected {
+					client.Disconnect()
+					disconnected = true
+				}
 				continue
 			}
 
 			log.Info().Str("exchange", client.Name()).Msg("Subscribed successfully, starting to read messages")
 			if err := client.ReadMessages(ctx); err != nil {
 				log.Error().Err(err).Str("exchange", client.Name()).Msg("Error reading messages")
-				client.Disconnect()
+				if !disconnected {
+					client.Disconnect()
+					disconnected = true
+				}
 			}
 		}
 	}

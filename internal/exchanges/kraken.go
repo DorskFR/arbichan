@@ -6,20 +6,12 @@ import (
 	"fmt"
 	"hash/crc32"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/dorskfr/arbichan/internal/messagetracker"
 	"github.com/dorskfr/arbichan/internal/orderbook"
-	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog/log"
 	"github.com/shopspring/decimal"
-)
-
-const (
-	// https://docs.kraken.com/api/docs/websocket-v2/book/
-	// https://docs.kraken.com/api/docs/guides/spot-ws-book-v2/
-	krakenWSURL = "wss://ws.kraken.com/v2"
 )
 
 // Should fit the different messages we can receive
@@ -93,54 +85,19 @@ type krakenSubscriptionAck struct {
 	Symbol   string `json:"symbol"`
 }
 type KrakenClient struct {
-	name           string
-	conn           *websocket.Conn
-	orderBooks     map[string]*orderbook.OrderBook
+	*BaseExchangeClient
 	messagetracker *messagetracker.MessageTracker
-	mu             sync.RWMutex
 }
 
 func NewKrakenClient() *KrakenClient {
 	return &KrakenClient{
-		name:           "kraken",
-		orderBooks:     make(map[string]*orderbook.OrderBook),
-		messagetracker: messagetracker.NewMessageTracker("kraken", time.Minute),
+		BaseExchangeClient: NewBaseExchangeClient("kraken", "wss://ws.kraken.com/v2"),
+		messagetracker:     messagetracker.NewMessageTracker("kraken", time.Minute),
 	}
 }
 
-func (c *KrakenClient) Name() string {
-	return c.name
-}
-
-func (c *KrakenClient) Connect() error {
-	conn, _, err := websocket.DefaultDialer.Dial(krakenWSURL, nil)
-	if err != nil {
-		return fmt.Errorf("error connecting to Kraken WebSocket: %w", err)
-	}
-	c.conn = conn
-	return nil
-}
-
-func (c *KrakenClient) Disconnect() {
-	log.Info().Str("exchange", c.name).Msg("Disconnecting")
-	if c.conn != nil {
-		c.conn.Close()
-	}
-}
-
-func (c *KrakenClient) RegisterOrderBook(symbol string, ob *orderbook.OrderBook) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.orderBooks[symbol] = ob
-	log.Info().Str("exchange", c.name).Str("symbol", symbol).Msg("Registering orderbook")
-}
-
-func (c *KrakenClient) GetOrderBook(symbol string) *orderbook.OrderBook {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.orderBooks[symbol]
-}
-
+// https://docs.kraken.com/api/docs/websocket-v2/book/
+// https://docs.kraken.com/api/docs/guides/spot-ws-book-v2/
 func (c *KrakenClient) Subscribe(pairs []string) error {
 	subscription := krakenSubscriptionRequest{
 		Method: "subscribe",
@@ -153,65 +110,35 @@ func (c *KrakenClient) Subscribe(pairs []string) error {
 	return c.conn.WriteJSON(subscription)
 }
 
-// Main function to read messages and keep the connection alive
 func (c *KrakenClient) ReadMessages(ctx context.Context) error {
-	pingTicker := time.NewTicker(50 * time.Second)
-	defer pingTicker.Stop()
+	return c.BaseExchangeClient.ReadMessages(ctx, c.handleMessage)
+}
 
-	for {
-		select {
-		// Exit when context is cancelled
-		case <-ctx.Done():
-			return ctx.Err()
-		// Send a ping to keep the connection alive
-		case <-pingTicker.C:
-			if err := c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
-				log.Warn().Err(err).Str("exchange", c.name).Msg("Failed to send ping")
-				return fmt.Errorf("failed to send ping: %w", err)
-			}
-			// Also trigger the messageTracker to check if the connection has disconnected / gone stale
-			c.messagetracker.CheckStaleConnection()
-
-		// Otherwise receive messages
-		default:
-			_, message, err := c.conn.ReadMessage()
-			if err != nil {
-				return fmt.Errorf("error reading message: %w", err)
-			}
-
-			// Update the tracker to signal the connection is active
-			c.messagetracker.RecordMessage()
-
-			var msg krakenMessage
-			if err := json.Unmarshal(message, &msg); err != nil {
-				log.Error().Err(err).Str("exchange", c.name).Str("rawMessage", string(message)).Msg("Error unmarshalling message")
-				continue
-			}
-
-			switch {
-			case msg.Error != "":
-				log.Error().Str("error", msg.Error).Msg("Could not subscribe")
-			// Process order book updates
-			case msg.Channel == "book":
-				var updates []krakenBookUpdate
-				if err := json.Unmarshal(msg.Data, &updates); err != nil {
-					log.Error().Err(err).Str("exchange", c.name).Str("msgData", string(msg.Data)).Msg("Error unmarshalling book data")
-					continue
-				}
-				for _, update := range updates {
-					c.applyBookUpdate(update)
-				}
-			case msg.Method == "subscribe" && *msg.Success:
-				log.Info().Str("exchange", c.name).Str("channel", msg.Result.Channel).Str("symbol", msg.Result.Symbol).Msg("Subscription successful")
-			// just silence those
-			case msg.Channel == "status":
-			case msg.Channel == "pong":
-			case msg.Channel == "heartbeat":
-			default:
-				log.Warn().Str("exchange", c.name).Str("rawMessage", string(message)).Msg("Unhandled message type")
-			}
-		}
+func (c *KrakenClient) handleMessage(message []byte) error {
+	var msg krakenMessage
+	if err := json.Unmarshal(message, &msg); err != nil {
+		return fmt.Errorf("error unmarshalling message: %w", err)
 	}
+
+	switch {
+	case msg.Error != "":
+		log.Error().Str("error", msg.Error).Msg("Could not subscribe")
+	case msg.Channel == "book":
+		var updates []krakenBookUpdate
+		if err := json.Unmarshal(msg.Data, &updates); err != nil {
+			return fmt.Errorf("error unmarshalling book data: %w", err)
+		}
+		for _, update := range updates {
+			c.applyBookUpdate(update)
+		}
+	case msg.Method == "subscribe" && *msg.Success:
+		log.Info().Str("exchange", c.Name()).Str("channel", msg.Result.Channel).Str("symbol", msg.Result.Symbol).Msg("Subscription successful")
+	case msg.Channel == "status", msg.Channel == "pong", msg.Channel == "heartbeat":
+		// Silently ignore these messages
+	default:
+		log.Warn().Str("exchange", c.Name()).Str("rawMessage", string(message)).Msg("Unhandled message type")
+	}
+	return nil
 }
 
 func (c *KrakenClient) applyBookUpdate(update krakenBookUpdate) {

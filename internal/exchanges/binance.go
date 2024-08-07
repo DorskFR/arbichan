@@ -7,27 +7,19 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/dorskfr/arbichan/internal/messagetracker"
 	"github.com/dorskfr/arbichan/internal/orderbook"
-	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog/log"
 	"github.com/shopspring/decimal"
 )
 
-const (
-	binanceAPIRestURL  = "https://api.binance.com/api/v3"
-	binanceStreamWSURL = "wss://stream.binance.com:9443/ws"
-)
+const binanceAPIRestURL = "https://api.binance.com/api/v3"
 
 type BinanceClient struct {
-	name           string
-	conn           *websocket.Conn
-	orderBooks     map[string]*orderbook.OrderBook
+	*BaseExchangeClient
 	messagetracker *messagetracker.MessageTracker
-	mu             sync.RWMutex
 	lastUpdateIDs  map[string]int64
 }
 
@@ -61,44 +53,10 @@ type binanceDepthUpdate struct {
 
 func NewBinanceClient() *BinanceClient {
 	return &BinanceClient{
-		name:           "binance",
-		orderBooks:     make(map[string]*orderbook.OrderBook),
-		lastUpdateIDs:  make(map[string]int64),
-		messagetracker: messagetracker.NewMessageTracker("binance", time.Minute),
+		BaseExchangeClient: NewBaseExchangeClient("binance", "wss://stream.binance.com:9443/ws"),
+		lastUpdateIDs:      make(map[string]int64),
+		messagetracker:     messagetracker.NewMessageTracker("binance", time.Minute),
 	}
-}
-
-func (c *BinanceClient) Name() string {
-	return c.name
-}
-
-func (c *BinanceClient) Connect() error {
-	conn, _, err := websocket.DefaultDialer.Dial(binanceStreamWSURL, nil)
-	if err != nil {
-		return fmt.Errorf("error connecting to Binance Stream WebSocket: %w", err)
-	}
-	c.conn = conn
-	return nil
-}
-
-func (c *BinanceClient) Disconnect() {
-	log.Info().Str("exchange", c.name).Msg("Disconnecting")
-	if c.conn != nil {
-		c.conn.Close()
-	}
-}
-
-func (c *BinanceClient) RegisterOrderBook(symbol string, ob *orderbook.OrderBook) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.orderBooks[symbol] = ob
-	log.Info().Str("exchange", c.name).Str("symbol", symbol).Msg("Registering orderbook")
-}
-
-func (c *BinanceClient) GetOrderBook(symbol string) *orderbook.OrderBook {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.orderBooks[symbol]
 }
 
 func (c *BinanceClient) Subscribe(symbols []string) error {
@@ -145,55 +103,22 @@ func (c *BinanceClient) Subscribe(symbols []string) error {
 	return nil
 }
 
-// Main function to read messages
 func (c *BinanceClient) ReadMessages(ctx context.Context) error {
-	messagetrackerTicker := time.NewTicker(time.Minute)
-	defer messagetrackerTicker.Stop()
+	return c.BaseExchangeClient.ReadMessages(ctx, c.handleMessage)
+}
 
-	for {
-		select {
-		// Stop when context is cancelled
-		case <-ctx.Done():
-			return ctx.Err()
-		// Check if the last message received is not too old
-		case <-messagetrackerTicker.C:
-			c.messagetracker.CheckStaleConnection()
-		// Otherwise process
-		default:
-			messageType, message, err := c.conn.ReadMessage()
-			if err != nil {
-				return fmt.Errorf("error reading message: %w", err)
-			}
-
-			// Refresh the messagetracker last message time
-			c.messagetracker.RecordMessage()
-
-			switch messageType {
-			case websocket.PingMessage:
-				// Binance pings every 3 min, respond to ping with a pong
-				if err := c.conn.WriteMessage(websocket.PongMessage, message); err != nil {
-					log.Warn().Err(err).Str("exchange", c.name).Msg("Failed to send pong")
-					return fmt.Errorf("error sending pong: %w", err)
-				}
-				log.Debug().Str("exchange", c.name).Msg("Received ping, sent pong")
-			case websocket.TextMessage:
-				var update binanceDepthUpdate
-				if err := json.Unmarshal(message, &update); err != nil {
-					log.Error().Err(err).Str("exchange", c.name).Msg("Error unmarshalling message")
-					continue
-				}
-
-				if update.Symbol == "" {
-					log.Error().Str("exchange", c.name).Str("message", string(message)).Msg("The message was not parsed correctly")
-					continue
-				}
-
-				c.handleDepthUpdate(update)
-			default:
-				log.Warn().Str("exchange", c.name).Int("messageType", messageType).Msg("Received unexpected message type")
-			}
-		}
+func (c *BinanceClient) handleMessage(message []byte) error {
+	var update binanceDepthUpdate
+	if err := json.Unmarshal(message, &update); err != nil {
+		return fmt.Errorf("error unmarshalling message: %w", err)
 	}
+
+	if update.Symbol == "" {
+		return fmt.Errorf("the message was not parsed correctly")
+	}
+
+	c.handleDepthUpdate(update)
+	return nil
 }
 
 func (c *BinanceClient) getDepthSnapshot(symbol string) error {
@@ -215,11 +140,11 @@ func (c *BinanceClient) getDepthSnapshot(symbol string) error {
 		return fmt.Errorf("error unmarshalling depth snapshot data: %w", err)
 	}
 
-	c.applyDepthSnapshot(symbol, &snapshot)
+	c.handleDepthSnapshot(symbol, &snapshot)
 	return nil
 }
 
-func (c *BinanceClient) applyDepthSnapshot(symbol string, snapshot *binanceDepthSnapshot) {
+func (c *BinanceClient) handleDepthSnapshot(symbol string, snapshot *binanceDepthSnapshot) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -233,16 +158,11 @@ func (c *BinanceClient) applyDepthSnapshot(symbol string, snapshot *binanceDepth
 	ob.Updates <- orderbook.PriceLevel{Type: "clear"}
 
 	// Apply snapshot data
-	for _, bid := range snapshot.Bids {
-		price, _ := decimal.NewFromString(bid[0])
-		amount, _ := decimal.NewFromString(bid[1])
-		ob.Updates <- orderbook.PriceLevel{Type: "bid", Price: price, Amount: amount, PriceStr: price.String(), AmountStr: amount.String()}
-	}
-	for _, ask := range snapshot.Asks {
-		price, _ := decimal.NewFromString(ask[0])
-		amount, _ := decimal.NewFromString(ask[1])
-		ob.Updates <- orderbook.PriceLevel{Type: "ask", Price: price, Amount: amount, PriceStr: price.String(), AmountStr: amount.String()}
-	}
+	c.applyDepthUpdate(ob, snapshot.Bids, snapshot.Asks)
+
+	// Ensure all updates are processed
+	ob.ProcessingComplete <- struct{}{}
+	<-ob.ProcessingComplete
 
 	c.lastUpdateIDs[symbol] = snapshot.LastUpdateID
 }
@@ -278,7 +198,7 @@ func (c *BinanceClient) handleDepthUpdate(update binanceDepthUpdate) {
 	}
 
 	// Apply the update
-	c.applyDepthUpdate(ob, update)
+	c.applyDepthUpdate(ob, update.Bids, update.Asks)
 
 	// Ensure all updates are processed
 	ob.ProcessingComplete <- struct{}{}
@@ -288,8 +208,8 @@ func (c *BinanceClient) handleDepthUpdate(update binanceDepthUpdate) {
 
 }
 
-func (c *BinanceClient) applyDepthUpdate(ob *orderbook.OrderBook, update binanceDepthUpdate) {
-	for _, bid := range update.Bids {
+func (c *BinanceClient) applyDepthUpdate(ob *orderbook.OrderBook, bids [][]string, asks [][]string) {
+	for _, bid := range bids {
 		price, _ := decimal.NewFromString(bid[0])
 		amount, _ := decimal.NewFromString(bid[1])
 		priceLevel := orderbook.PriceLevel{
@@ -301,7 +221,7 @@ func (c *BinanceClient) applyDepthUpdate(ob *orderbook.OrderBook, update binance
 		}
 		ob.Updates <- priceLevel
 	}
-	for _, ask := range update.Asks {
+	for _, ask := range asks {
 		price, _ := decimal.NewFromString(ask[0])
 		amount, _ := decimal.NewFromString(ask[1])
 		priceLevel := orderbook.PriceLevel{
