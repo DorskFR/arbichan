@@ -4,26 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/dorskfr/arbichan/internal/messagetracker"
 	"github.com/dorskfr/arbichan/internal/orderbook"
-	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog/log"
 	"github.com/shopspring/decimal"
 )
 
-const (
-	poloniexPublicWSURL = "wss://ws.poloniex.com/ws/public"
-)
-
 type PoloniexClient struct {
-	name           string
-	conn           *websocket.Conn
-	orderBooks     map[string]*orderbook.OrderBook
+	*BaseExchangeClient
 	messagetracker *messagetracker.MessageTracker
-	mu             sync.RWMutex
 	lastIDs        map[string]int64
 }
 
@@ -52,44 +43,10 @@ type poloniexOrderBookUpdate struct {
 
 func NewPoloniexClient() *PoloniexClient {
 	return &PoloniexClient{
-		name:           "poloniex",
-		orderBooks:     make(map[string]*orderbook.OrderBook),
-		lastIDs:        make(map[string]int64),
-		messagetracker: messagetracker.NewMessageTracker("poloniex", time.Minute),
+		BaseExchangeClient: NewBaseExchangeClient("poloniex", "wss://ws.poloniex.com/ws/public"),
+		lastIDs:            make(map[string]int64),
+		messagetracker:     messagetracker.NewMessageTracker("poloniex", time.Minute),
 	}
-}
-
-func (c *PoloniexClient) Name() string {
-	return c.name
-}
-
-func (c *PoloniexClient) Connect() error {
-	conn, _, err := websocket.DefaultDialer.Dial(poloniexPublicWSURL, nil)
-	if err != nil {
-		return fmt.Errorf("error connecting to Poloniex WebSocket: %w", err)
-	}
-	c.conn = conn
-	return nil
-}
-
-func (c *PoloniexClient) Disconnect() {
-	log.Info().Str("exchange", c.name).Msg("Disconnecting")
-	if c.conn != nil {
-		c.conn.Close()
-	}
-}
-
-func (c *PoloniexClient) RegisterOrderBook(symbol string, ob *orderbook.OrderBook) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.orderBooks[symbol] = ob
-	log.Info().Str("exchange", c.name).Str("symbol", symbol).Msg("Registering orderbook")
-}
-
-func (c *PoloniexClient) GetOrderBook(symbol string) *orderbook.OrderBook {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.orderBooks[symbol]
 }
 
 func (c *PoloniexClient) Subscribe(symbols []string) error {
@@ -126,45 +83,19 @@ func (c *PoloniexClient) Subscribe(symbols []string) error {
 }
 
 func (c *PoloniexClient) ReadMessages(ctx context.Context) error {
-	messagetrackerTicker := time.NewTicker(time.Minute)
-	defer messagetrackerTicker.Stop()
+	return c.BaseExchangeClient.ReadMessages(ctx, c.handleMessage)
+}
 
-	pingTicker := time.NewTicker(25 * time.Second)
-	defer pingTicker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-messagetrackerTicker.C:
-			c.messagetracker.CheckStaleConnection()
-		case <-pingTicker.C:
-			pingReq := poloniexWSRequest{
-				Event: "ping",
-			}
-			if err := c.conn.WriteJSON(pingReq); err != nil {
-				log.Warn().Err(err).Str("exchange", c.name).Msg("Failed to send ping")
-				return fmt.Errorf("error sending ping: %w", err)
-			}
-		default:
-			_, message, err := c.conn.ReadMessage()
-			if err != nil {
-				return fmt.Errorf("error reading message: %w", err)
-			}
-
-			c.messagetracker.RecordMessage()
-
-			var response poloniexWSResponse
-			if err := json.Unmarshal(message, &response); err != nil {
-				log.Error().Err(err).Str("exchange", c.name).Msg("Error unmarshalling message")
-				continue
-			}
-
-			for _, update := range response.Data {
-				c.handleOrderBookUpdate(update)
-			}
-		}
+func (c *PoloniexClient) handleMessage(message []byte) error {
+	var response poloniexWSResponse
+	if err := json.Unmarshal(message, &response); err != nil {
+		return fmt.Errorf("error unmarshalling message: %w", err)
 	}
+
+	for _, update := range response.Data {
+		c.handleOrderBookUpdate(update)
+	}
+	return nil
 }
 
 func (c *PoloniexClient) handleOrderBookUpdate(update poloniexOrderBookUpdate) {
