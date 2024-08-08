@@ -90,10 +90,9 @@ type KrakenClient struct {
 }
 
 func NewKrakenClient() *KrakenClient {
-	return &KrakenClient{
-		BaseExchangeClient: NewBaseExchangeClient("kraken", "wss://ws.kraken.com/v2"),
-		messagetracker:     messagetracker.NewMessageTracker("kraken", time.Minute),
-	}
+	krakenClient := &KrakenClient{messagetracker: messagetracker.NewMessageTracker("kraken", time.Minute)}
+	krakenClient.BaseExchangeClient = NewBaseExchangeClient("kraken", "wss://ws.kraken.com/v2", krakenClient)
+	return krakenClient
 }
 
 // https://docs.kraken.com/api/docs/websocket-v2/book/
@@ -111,12 +110,12 @@ func (c *KrakenClient) Subscribe(pairs []string) error {
 }
 
 func (c *KrakenClient) ReadMessages(ctx context.Context) error {
-	return c.BaseExchangeClient.ReadMessages(ctx, c.handleMessage)
+	return c.BaseExchangeClient.ReadMessages(ctx, c.handleMessage, 50*time.Second)
 }
 
-func (c *KrakenClient) handleMessage(message []byte) error {
+func (c *KrakenClient) handleMessage(message WebSocketMessage) error {
 	var msg krakenMessage
-	if err := json.Unmarshal(message, &msg); err != nil {
+	if err := json.Unmarshal(message.Data, &msg); err != nil {
 		return fmt.Errorf("error unmarshalling message: %w", err)
 	}
 
@@ -136,7 +135,7 @@ func (c *KrakenClient) handleMessage(message []byte) error {
 	case msg.Channel == "status", msg.Channel == "pong", msg.Channel == "heartbeat":
 		// Silently ignore these messages
 	default:
-		log.Warn().Str("exchange", c.Name()).Str("rawMessage", string(message)).Msg("Unhandled message type")
+		log.Warn().Str("exchange", c.Name()).Str("rawMessage", string(message.Data)).Msg("Unhandled message type")
 	}
 	return nil
 }

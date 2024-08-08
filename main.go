@@ -25,6 +25,7 @@ func main() {
 				{Exchange: "binance", Symbol: "BTCUSDT"},
 				{Exchange: "kraken", Symbol: "BTC/USD"},
 				{Exchange: "poloniex", Symbol: "BTC_USDT"},
+				{Exchange: "bitflyer", Symbol: "BTC_USD"},
 			},
 			ProfitThreshold: decimal.NewFromFloat32(0.50),
 		},
@@ -39,6 +40,7 @@ func main() {
 	// Create exchange clients
 	exchangeClients := map[string]exchanges.ExchangeClient{
 		"binance":  exchanges.NewBinanceClient(),
+		"bitflyer": exchanges.NewBitflyerClient(),
 		"kraken":   exchanges.NewKrakenClient(),
 		"poloniex": exchanges.NewPoloniexClient(),
 	}

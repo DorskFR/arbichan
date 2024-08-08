@@ -11,6 +11,7 @@ import (
 
 	"github.com/dorskfr/arbichan/internal/messagetracker"
 	"github.com/dorskfr/arbichan/internal/orderbook"
+	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog/log"
 	"github.com/shopspring/decimal"
 )
@@ -52,11 +53,12 @@ type binanceDepthUpdate struct {
 }
 
 func NewBinanceClient() *BinanceClient {
-	return &BinanceClient{
-		BaseExchangeClient: NewBaseExchangeClient("binance", "wss://stream.binance.com:9443/ws"),
-		lastUpdateIDs:      make(map[string]int64),
-		messagetracker:     messagetracker.NewMessageTracker("binance", time.Minute),
+	binanceClient := &BinanceClient{
+		lastUpdateIDs:  make(map[string]int64),
+		messagetracker: messagetracker.NewMessageTracker("binance", time.Minute),
 	}
+	binanceClient.BaseExchangeClient = NewBaseExchangeClient("binance", "wss://stream.binance.com:9443/ws", binanceClient)
+	return binanceClient
 }
 
 func (c *BinanceClient) Subscribe(symbols []string) error {
@@ -104,20 +106,30 @@ func (c *BinanceClient) Subscribe(symbols []string) error {
 }
 
 func (c *BinanceClient) ReadMessages(ctx context.Context) error {
-	return c.BaseExchangeClient.ReadMessages(ctx, c.handleMessage)
+	return c.BaseExchangeClient.ReadMessages(ctx, c.handleMessage, time.Minute)
 }
 
-func (c *BinanceClient) handleMessage(message []byte) error {
-	var update binanceDepthUpdate
-	if err := json.Unmarshal(message, &update); err != nil {
-		return fmt.Errorf("error unmarshalling message: %w", err)
-	}
+func (c *BinanceClient) handleMessage(message WebSocketMessage) error {
+	switch message.Type {
+	case websocket.PingMessage:
+		// Binance pings every 3 min, respond to ping with a pong
+		if err := c.conn.WriteMessage(websocket.PongMessage, message.Data); err != nil {
+			log.Warn().Err(err).Str("exchange", c.name).Msg("Failed to send pong")
+			return fmt.Errorf("error sending pong: %w", err)
+		}
+		log.Debug().Str("exchange", c.name).Msg("Received ping, sent pong")
+	case websocket.TextMessage:
+		var update binanceDepthUpdate
+		if err := json.Unmarshal(message.Data, &update); err != nil {
+			return fmt.Errorf("error unmarshalling message: %w", err)
+		}
 
-	if update.Symbol == "" {
-		return fmt.Errorf("the message was not parsed correctly")
-	}
+		if update.Symbol == "" {
+			return fmt.Errorf("the message was not parsed correctly")
+		}
 
-	c.handleDepthUpdate(update)
+		c.handleDepthUpdate(update)
+	}
 	return nil
 }
 
