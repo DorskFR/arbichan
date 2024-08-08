@@ -32,9 +32,7 @@ type ExchangeClient interface {
 	GetOrderBook(symbol string) *orderbook.OrderBook
 	Subscribe(pairs []string) error
 	ReadMessages(ctx context.Context) error
-}
-
-type BaseExchange struct {
+	SendPing() error
 }
 
 type BaseExchangeClient struct {
@@ -44,13 +42,20 @@ type BaseExchangeClient struct {
 	orderBooks     map[string]*orderbook.OrderBook
 	mu             sync.RWMutex
 	messagetracker messagetracker.MessageTracker
+	client         ExchangeClient
 }
 
-func NewBaseExchangeClient(name string, url string) *BaseExchangeClient {
+type WebSocketMessage struct {
+	Type int
+	Data []byte
+}
+
+func NewBaseExchangeClient(name string, url string, client ExchangeClient) *BaseExchangeClient {
 	return &BaseExchangeClient{
 		name:       name,
 		url:        url,
 		orderBooks: make(map[string]*orderbook.OrderBook),
+		client:     client,
 	}
 }
 
@@ -87,25 +92,29 @@ func (c *BaseExchangeClient) Disconnect() {
 	}
 }
 
-func (c *BaseExchangeClient) ReadMessages(ctx context.Context, handleMessage func([]byte) error) error {
+func (c *BaseExchangeClient) ReadMessages(
+	ctx context.Context,
+	handleMessage func(WebSocketMessage) error,
+	pingInterval time.Duration,
+) error {
 	messagetrackerTicker := time.NewTicker(15 * time.Minute)
 	defer messagetrackerTicker.Stop()
 
-	pingTicker := time.NewTicker(time.Minute)
+	pingTicker := time.NewTicker(pingInterval)
 	defer pingTicker.Stop()
 
-	readChan := make(chan []byte)
+	readChan := make(chan WebSocketMessage)
 	errChan := make(chan error)
 
 	go func() {
 		for {
-			_, message, err := c.conn.ReadMessage()
+			messageType, message, err := c.conn.ReadMessage()
 			if err != nil {
 				errChan <- err
 				return
 			}
 			select {
-			case readChan <- message:
+			case readChan <- WebSocketMessage{Type: messageType, Data: message}:
 			case <-ctx.Done():
 				return
 			}
@@ -119,7 +128,7 @@ func (c *BaseExchangeClient) ReadMessages(ctx context.Context, handleMessage fun
 		case <-messagetrackerTicker.C:
 			c.messagetracker.CheckStaleConnection()
 		case <-pingTicker.C:
-			if err := c.sendPing(); err != nil {
+			if err := c.client.SendPing(); err != nil {
 				return err
 			}
 		case err := <-errChan:
@@ -133,7 +142,8 @@ func (c *BaseExchangeClient) ReadMessages(ctx context.Context, handleMessage fun
 	}
 }
 
-func (c *BaseExchangeClient) sendPing() error {
+func (c *BaseExchangeClient) SendPing() error {
+	log.Warn().Msg("Calling SendPing from base implementation")
 	if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 		log.Warn().Err(err).Str("exchange", c.Name()).Msg("Failed to send ping")
 		return fmt.Errorf("error sending ping: %w", err)

@@ -42,11 +42,13 @@ type poloniexOrderBookUpdate struct {
 }
 
 func NewPoloniexClient() *PoloniexClient {
-	return &PoloniexClient{
-		BaseExchangeClient: NewBaseExchangeClient("poloniex", "wss://ws.poloniex.com/ws/public"),
+	poloniexClient := &PoloniexClient{
 		lastIDs:            make(map[string]int64),
 		messagetracker:     messagetracker.NewMessageTracker("poloniex", time.Minute),
 	}
+	poloniexClient.BaseExchangeClient = NewBaseExchangeClient("poloniex", "wss://ws.poloniex.com/ws/public", poloniexClient)
+	return poloniexClient
+
 }
 
 func (c *PoloniexClient) Subscribe(symbols []string) error {
@@ -83,17 +85,29 @@ func (c *PoloniexClient) Subscribe(symbols []string) error {
 }
 
 func (c *PoloniexClient) ReadMessages(ctx context.Context) error {
-	return c.BaseExchangeClient.ReadMessages(ctx, c.handleMessage)
+	return c.BaseExchangeClient.ReadMessages(ctx, c.handleMessage, 25*time.Second)
 }
 
-func (c *PoloniexClient) handleMessage(message []byte) error {
+func (c *PoloniexClient) handleMessage(message WebSocketMessage) error {
 	var response poloniexWSResponse
-	if err := json.Unmarshal(message, &response); err != nil {
+	if err := json.Unmarshal(message.Data, &response); err != nil {
 		return fmt.Errorf("error unmarshalling message: %w", err)
 	}
 
 	for _, update := range response.Data {
 		c.handleOrderBookUpdate(update)
+	}
+	return nil
+}
+
+func (c *PoloniexClient) SendPing() error {
+	log.Warn().Msg("Calling SendPing from poloniex implementation")
+	pingReq := poloniexWSRequest{
+		Event: "ping",
+	}
+	if err := c.conn.WriteJSON(pingReq); err != nil {
+		log.Warn().Err(err).Str("exchange", c.name).Msg("Failed to send ping")
+		return fmt.Errorf("error sending ping: %w", err)
 	}
 	return nil
 }
@@ -131,6 +145,7 @@ func (c *PoloniexClient) handleOrderBookUpdate(update poloniexOrderBookUpdate) {
 
 func (c *PoloniexClient) applyOrderBookSnapshot(ob *orderbook.OrderBook, snapshot poloniexOrderBookUpdate) {
 	// Clear existing order book data
+	// TODO: Not implemented yet
 	ob.Updates <- orderbook.PriceLevel{Type: "clear"}
 
 	// Apply snapshot data

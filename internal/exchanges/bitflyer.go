@@ -56,10 +56,9 @@ type price struct {
 }
 
 func NewBitflyerClient() *BitflyerClient {
-	return &BitflyerClient{
-		BaseExchangeClient: NewBaseExchangeClient("bitflyer", "wss://ws.lightstream.bitflyer.com/json-rpc"),
-		messagetracker:     messagetracker.NewMessageTracker("bitflyer", time.Minute),
-	}
+	bitflyerClient := &BitflyerClient{messagetracker: messagetracker.NewMessageTracker("bitflyer", time.Minute)}
+	bitflyerClient.BaseExchangeClient = NewBaseExchangeClient("bitflyer", "wss://ws.lightstream.bitflyer.com/json-rpc", bitflyerClient)
+	return bitflyerClient
 }
 
 func (c *BitflyerClient) Subscribe(symbols []string) error {
@@ -82,12 +81,12 @@ func (c *BitflyerClient) Subscribe(symbols []string) error {
 }
 
 func (c *BitflyerClient) ReadMessages(ctx context.Context) error {
-	return c.BaseExchangeClient.ReadMessages(ctx, c.handleMessage)
+	return c.BaseExchangeClient.ReadMessages(ctx, c.handleMessage, time.Minute)
 }
 
-func (c *BitflyerClient) handleMessage(message []byte) error {
+func (c *BitflyerClient) handleMessage(message WebSocketMessage) error {
 	var response bitflyerWSResponse
-	if err := json.Unmarshal(message, &response); err != nil {
+	if err := json.Unmarshal(message.Data, &response); err != nil {
 		return fmt.Errorf("error unmarshalling message: %w", err)
 	}
 
