@@ -143,7 +143,6 @@ func (c *BaseExchangeClient) ReadMessages(
 }
 
 func (c *BaseExchangeClient) SendPing() error {
-	log.Warn().Msg("Calling SendPing from base implementation")
 	if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 		log.Warn().Err(err).Str("exchange", c.Name()).Msg("Failed to send ping")
 		return fmt.Errorf("error sending ping: %w", err)
