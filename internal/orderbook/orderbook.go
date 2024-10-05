@@ -117,6 +117,15 @@ func (ob *OrderBook) applyUpdate(update PriceLevel) {
 	} else if update.Type == "ask" {
 		ob.updateLevels(update, &ob.asks)
 	}
+
+	// log.
+	// 	Debug().
+	// 	Str("exchange", ob.exchange).
+	// 	Str("symbol", ob.symbol).
+	// 	Str("price", update.PriceStr).
+	// 	Str("amount", update.AmountStr).
+	// 	Msg("Got an update!")
+
 }
 
 // updateLevels updates either the bid or ask levels

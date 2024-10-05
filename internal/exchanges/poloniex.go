@@ -43,8 +43,8 @@ type poloniexOrderBookUpdate struct {
 
 func NewPoloniexClient() *PoloniexClient {
 	poloniexClient := &PoloniexClient{
-		lastIDs:            make(map[string]int64),
-		messagetracker:     messagetracker.NewMessageTracker("poloniex", time.Minute),
+		lastIDs:        make(map[string]int64),
+		messagetracker: messagetracker.NewMessageTracker("poloniex", time.Minute),
 	}
 	poloniexClient.BaseExchangeClient = NewBaseExchangeClient("poloniex", "wss://ws.poloniex.com/ws/public", poloniexClient)
 	return poloniexClient
@@ -101,7 +101,6 @@ func (c *PoloniexClient) handleMessage(message WebSocketMessage) error {
 }
 
 func (c *PoloniexClient) SendPing() error {
-	log.Warn().Msg("Calling SendPing from poloniex implementation")
 	pingReq := poloniexWSRequest{
 		Event: "ping",
 	}
