@@ -2,7 +2,7 @@ module github.com/dorskfr/arbichan
 
 go 1.25.0
 
-toolchain go1.26.5
+toolchain go1.27.0
 
 require (
 	github.com/gorilla/websocket v1.5.3
